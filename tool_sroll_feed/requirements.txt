@@ -1,0 +1,13 @@
+playwright
+playwright-stealth
+shazamio
+openai-whisper
+pydub
+webrtcvad
+requests
+librosa
+sqlmodel
+python-dotenv
+ffmpeg-python
+pandas
+openpyxl

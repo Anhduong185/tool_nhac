@@ -1,0 +1,28 @@
+# Python rác
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# TikTok Data (NHẠY CẢM - KHÔNG ĐẨY LÊN)
+tool_sroll_feed/tiktok_session/
+tool_nhac/tiktok_session/
+tool_nhac/cookies.json
+*.db
+*.db-journal
+
+# File kết quả & Tạm thời
+*.xlsx
+*.csv
+tool_nhac/static/audio_cache/
+temp_audio/
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/

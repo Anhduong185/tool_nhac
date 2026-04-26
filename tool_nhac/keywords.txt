@@ -1,0 +1,71 @@
+# ==========================================
+# TIKTOK AUDIO CRAWLER - OPTIMIZED VOICE-OVER KEYWORDS
+# Chủ đề: Kể chuyện (Storytime), Lời khuyên (Advice), Sự thật phũ phàng (Harsh truths), Podcast, Hài hước mỉa mai
+# Mục tiêu: Nhắm thẳng vào các video 100% người thật nói chuyện, không lồng nhạc nền, tỷ lệ qua kiểm duyệt cực cao
+# ==========================================
+
+# 🎙️ TIẾNG ANH (Storytime, Podcast, Truths - Tỷ lệ voice cực cao)
+nobody talks about this but
+the harsh truth about making money
+listen to me very carefully
+a message for someone who needs it
+psychology trick to make money
+things i wish i knew before my 20s
+the dark side of corporate life
+why you should never trust
+unpopular opinion about money
+storytime how i quit my job
+let's talk about why you are broke
+if you are watching this, it's a sign
+stop doing this if you want to be rich
+the reality of living alone
+
+# 🌍 CHÂU PHI (Africa/Nigeria/Kenya)
+wahala be like bicycle
+african parents logic when it comes to money
+living in lagos as a freelancer
+when sapa catches you
+african moms will always say
+the struggle of being the eldest african child
+pov your african dad finds out
+how to survive in kenya
+
+# 🇷🇺 NGA (Russia - Cuộc sống, Hài hước, Sự thật)
+как заработать в интернете с нуля
+история из жизни которая научила
+почему я ушел с работы
+правда о фрилансе
+типичные родители в россии
+жизнь в общаге
+советы которые изменят жизнь
+смешные истории из школы
+
+# 🇩🇪 ĐỨC (Germany - Cuộc sống, Đi làm, Tâm sự)
+dinge die ich gerne früher gewusst hätte
+warum du kündigen solltest
+leben in deutschland als azubi
+typisch deutsche eltern
+lustige büro stories
+wie man online geld verdient
+die wahrheit über selbstständigkeit
+pov du bist auf der arbeit
+
+# 🇹🇭 THÁI LAN (Thái Lan - Tâm sự, Hài hước)
+ความลับที่คนรวยไม่เคยบอก
+เรื่องตลกในออฟฟิศ
+ความจริงของการเป็นวัยรุ่นสร้างตัว
+สิ่งที่เรียนรู้จากการทำงานหนัก
+ข้อคิดในการใช้ชีวิต
+แชร์ประสบการณ์ลาออก
+เรื่องเล่าผี
+เล่าประสบการณ์หลอน
+
+# 🇮🇩 INDONESIA (Indonesia - Cuộc sống, Đi làm, Tiền bạc)
+fakta pahit dunia kerja
+cara dapet uang dari internet pemula
+kisah sedih anak rantau
+lucunya orang indonesia kalau lagi miskin
+realita anak muda zaman now
+nasihat untuk diriku sendiri
+jangan pernah lakukan ini kalau mau sukses
+cerita horor asli
