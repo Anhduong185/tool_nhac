@@ -1,3 +1,10 @@
+# File thực thi & Binary (NẶNG - KHÔNG ĐẨY LÊN)
+*.exe
+ffmpeg-8.1-essentials_build/
+ffplay.exe
+ffprobe.exe
+ffmpeg.exe
+
 # Python rác
 __pycache__/
 *.pyc
