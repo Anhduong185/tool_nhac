@@ -36,7 +36,7 @@ from config import WHISPER_MODEL_SIZE
 
 
 # ── Ngưỡng V2.1 ──────────────────────────────────────────────────────────────
-NO_SPEECH_PROB_THRESHOLD = 0.40   # Segment nào > 0.40 → coi là nhạc/im lặng
+NO_SPEECH_PROB_THRESHOLD = 0.70   # Nới lỏng: Chỉ coi là nhạc/ồn khi chắc chắn > 70%
 MIN_SEGMENT_DURATION     = 0.5    # Bỏ qua segment < 0.5s (noise flash)
 
 
@@ -114,11 +114,7 @@ class SpeechClassifier:
                 segments_iter, info = self.model.transcribe(
                     file_path,
                     beam_size=1,
-                    vad_filter=True,          # Bật VAD nội bộ của Whisper
-                    vad_parameters=dict(
-                        min_silence_duration_ms=300,
-                        speech_pad_ms=100,
-                    ),
+                    vad_filter=False,  # TẮT VAD nội bộ vì SmartAudioTrimmer đã cắt chuẩn rồi
                 )
 
                 total_duration   = info.duration or 0.0
@@ -154,6 +150,7 @@ class SpeechClassifier:
                     avg_no_speech = 0.05  # Tất cả segment đều pass → rất sạch
 
                 speech_ratio = round(speech_duration / total_duration, 3) if total_duration > 0 else 0.0
+                speech_ratio = max(0.0, min(1.0, speech_ratio)) # Giới hạn 0-100%
 
                 result = SpeechResult(
                     speech_ratio    = speech_ratio,

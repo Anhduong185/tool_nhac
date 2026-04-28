@@ -38,17 +38,25 @@ from database import (
 ROOT_DIR = Path(__file__).resolve().parent
 
 # ── Cấu hình ngưỡng AI V2.1 ──────────────────────────────────────────────────
-SPEECH_RATIO_PASS   = 0.85   # > 0.85 → PASS trực tiếp (skip YAMNet)
-SPEECH_RATIO_DROP   = 0.55   # < 0.55 → DROP trực tiếp (skip YAMNet)
-NO_SPEECH_PROB_MAX  = 0.40   # no_speech_prob > 0.40 → coi là nhạc
-MUSIC_RATIO_MAX     = 0.30   # music_ratio > 0.30 → DROP (YAMNet)
-MIN_AUDIO_SCORE     = 10.0   # Hạ ngưỡng để không loại oan các audio speech tốt nhưng chưa trending
+PURE_SPEECH_MODE    = True   # Chỉ nhận spoken-word gần như sạch hoàn toàn
+SPEECH_RATIO_PASS   = 0.80   # Chỉ coi là speech sạch khi ratio cực cao
+SPEECH_RATIO_DROP   = 0.80   # < 0.80 → DROP trực tiếp
+NO_SPEECH_PROB_MAX  = 0.60   # Cho phép tạp âm/nhạc nền nhỏ (trước là 0.15 quá gắt)
+MUSIC_RATIO_MAX     = 0.00   # Zero-tolerance: phát hiện nhạc nền là loại
+SEGMENT_PURITY_MIN  = 0.80   # >= 92% segment phải là speech sạch
+MIN_AUDIO_SCORE     = 0   # Hạ ngưỡng để không loại oan các audio speech tốt nhưng chưa trending
 
 # ── Ngưỡng Usage theo trend ───────────────────────────────────────────────────
 USAGE_EARLY_TREND   = 300    # Early trend dùng ngưỡng thấp hơn
 
 # ── Creator Expansion rule ────────────────────────────────────────────────────
 EXPAND_MIN_APPEARANCES = 2   # Creator phải xuất hiện >= 2 lần trong hệ thống
+YAMNET_EFFECT_KEYWORDS = [
+    "laughter", "laughing", "chuckle", "giggle", "snicker",
+    "applause", "clapping", "cheering", "crowd",
+    "sound effect", "sfx", "whoosh", "boom", "bang",
+    "gasp", "scream", "shout", "yell",
+]
 
 
 # ── Result container ──────────────────────────────────────────────────────────
@@ -138,7 +146,11 @@ class SmartAudioTrimmer:
             # Thử dùng read_audio mặc định của Silero
             try:
                 wav = read_audio(wav_path, sampling_rate=16000)
-                logger.debug("VAD: Using torchaudio + torchcodec")
+                # Ép chạy CPU cho VAD theo yêu cầu
+                device = "cpu"
+                wav = wav.to(device)
+                self._vad_model.to(device)
+                logger.debug(f"VAD: Running on {device.upper()} (torchaudio+torchcodec)")
             except Exception as e:
                 # Nếu fail (lỗi torchaudio/torchcodec), dùng pydub để load thay thế
                 logger.debug(f"Silero read_audio failed, using pydub fallback: {e}")
@@ -147,9 +159,18 @@ class SmartAudioTrimmer:
                 audio = AudioSegment.from_file(wav_path).set_frame_rate(16000).set_channels(1)
                 samples = np.array(audio.get_array_of_samples()).astype(np.float32)
                 # Chuẩn hoá về khoảng [-1.0, 1.0]
-                wav = torch.from_numpy(samples) / (2**15)
+                device = "cpu"
+                wav = (torch.from_numpy(samples) / (2**15)).to(device)
+                self._vad_model.to(device)
+                logger.debug(f"VAD: Running on {device.upper()} (pydub fallback)")
 
-            timestamps = get_speech_timestamps(wav, self._vad_model, sampling_rate=16000)
+            try:
+                # Tránh lỗi "index out of range" bằng cách bọc an toàn
+                timestamps = get_speech_timestamps(wav, self._vad_model, sampling_rate=16000)
+            except Exception as ve:
+                logger.warning(f"⚠️ VAD internal error: {ve}. Dùng fallback toàn bộ audio.")
+                timestamps = [{"start": 0, "end": len(wav)}]
+                
             # Chuyển từ sample → giây
             return [{"start": t["start"] / 16000, "end": t["end"] / 16000} for t in timestamps]
         except Exception as e:
@@ -299,20 +320,23 @@ class AIAnalyzer:
         agg = self._whisper.aggregate_segments(raw_results)
         speech_ratio   = agg.speech_ratio
         no_speech_prob = agg.no_speech_prob
+        segment_purity = round(agg.speech_segments / agg.segment_count, 3) if agg.segment_count > 0 else 0.0
 
         # ── Bước 2: Conditional YAMNet ────────────────────────────────────
         avg_music = 0.0
-        method    = "whisper_only"
+        method    = "whisper_music_gate"
+        effect_detected = False
+        effect_label = ""
 
-        if speech_ratio > SPEECH_RATIO_PASS:
+        if speech_ratio < SPEECH_RATIO_DROP or no_speech_prob > NO_SPEECH_PROB_MAX:
             # Rõ ràng là giọng nói → skip YAMNet hoàn toàn
-            method = "whisper_pass_direct"
-            logger.debug(f"    AI: PASS direct (speech={speech_ratio:.2f} > {SPEECH_RATIO_PASS})")
-
-        elif speech_ratio < SPEECH_RATIO_DROP or no_speech_prob > NO_SPEECH_PROB_MAX:
-            # Rõ ràng là nhạc/rác → skip YAMNet, DROP luôn
             method = "whisper_drop_direct"
             logger.debug(f"    AI: DROP direct (speech={speech_ratio:.2f}, no_sp={no_speech_prob:.2f})")
+
+        # else:
+            # Rõ ràng là nhạc/rác → skip YAMNet, DROP luôn
+            # method = "whisper_drop_direct"
+            # logger.debug(f"    AI: DROP direct (speech={speech_ratio:.2f}, no_sp={no_speech_prob:.2f})")
 
         else:
             # Vùng xám 0.40–0.65 → chạy YAMNet để phán quyết
@@ -320,6 +344,9 @@ class AIAnalyzer:
             if self._yamnet and self._yamnet.is_available():
                 yamnet_result = self._yamnet.classify_segments(segment_paths)
                 avg_music = yamnet_result.music_ratio
+                top_class_lower = (yamnet_result.top_class or "").lower()
+                effect_detected = any(keyword in top_class_lower for keyword in YAMNET_EFFECT_KEYWORDS)
+                effect_label = yamnet_result.top_class if effect_detected else ""
                 method = "yamnet_confirmed"
                 logger.debug(f"    AI: YAMNet {yamnet_result.summary()}")
             else:
@@ -331,6 +358,9 @@ class AIAnalyzer:
             "speech_ratio":   round(speech_ratio, 3),
             "no_speech_prob": round(no_speech_prob, 3),
             "music_ratio":    round(avg_music, 3),
+            "segment_purity": round(segment_purity, 3),
+            "effect_detected": effect_detected,
+            "effect_label": effect_label,
             "method":         method,
         }
 
@@ -385,6 +415,7 @@ class AudioPipeline:
         self.trimmer  = SmartAudioTrimmer()
         self.analyzer = AIAnalyzer()
         self._seen_ids: set = set()   # In-memory cache nhanh (dedup)
+        self._ai_lock = asyncio.Lock() # Tránh xung đột C++ PyTorch khi đa luồng
 
     async def process(
         self,
@@ -453,13 +484,17 @@ class AudioPipeline:
         from audio_processor import download_audio
         dl_ok = await download_audio(audio)
         if not dl_ok or not audio.file_path:
-            return await drop("DOWNLOAD", "Download failed")
+            audio.status = "download_failed"
+            audio.reason = getattr(audio, "download_error", None) or "Download failed"
+            await insert_audio(audio)
+            return PipelineResult(audio, False, "DOWNLOAD", audio.reason)
 
         # Cắt audio thông minh (VAD + ffmpeg)
         try:
-            segment_paths, has_speech_vad = await asyncio.to_thread(
-                self.trimmer.trim, audio.file_path, float(audio.duration)
-            )
+            async with self._ai_lock:
+                segment_paths, has_speech_vad = await asyncio.to_thread(
+                    self.trimmer.trim, audio.file_path, float(audio.duration)
+                )
         except Exception as e:
             logger.error(f"Trim error: {e}")
             segment_paths, has_speech_vad = [], False
@@ -472,19 +507,21 @@ class AudioPipeline:
             return await drop("VAD", "Không phát hiện giọng người (VAD)")
 
         if not segment_paths:
-            # Fallback: nếu VAD không chạy được nhưng has_speech=True → dùng gì?
-            # Không có segment → không thể chạy AI → reject an toàn
             return await drop("VAD", "Không cắt được segment")
 
         # ── [7] AI ANALYSIS + SHAZAM (song song) ──────────────────────────
         try:
             from audio_processor import check_shazam
-            # Chạy Whisper/YAMNet và Shazam CÙNG LÚC để tiết kiệm thời gian
-            ai_task     = asyncio.to_thread(self.analyzer.analyze_segments, segment_paths)
-            # Shazam dùng 1 segment đại diện (segment đầu tiên)
+            
+            async def _safe_ai_analyze():
+                async with self._ai_lock:
+                    return await asyncio.to_thread(self.analyzer.analyze_segments, segment_paths)
+
+            ai_task = _safe_ai_analyze()
             shazam_path = segment_paths[0] if segment_paths else None
             async def _no_shazam():
                 return False
+
             shazam_task = check_shazam(shazam_path) if shazam_path else _no_shazam()
 
             ai_result, is_copyrighted = await asyncio.gather(ai_task, shazam_task, return_exceptions=True)
@@ -508,6 +545,9 @@ class AudioPipeline:
         speech_ratio   = ai_result["speech_ratio"]
         no_speech_prob = ai_result["no_speech_prob"]
         music_ratio    = ai_result["music_ratio"]
+        segment_purity = ai_result.get("segment_purity", 0.0)
+        effect_detected = ai_result.get("effect_detected", False)
+        effect_label = ai_result.get("effect_label", "")
         method         = ai_result["method"]
 
         audio.speech_ratio = speech_ratio
@@ -523,6 +563,18 @@ class AudioPipeline:
 
         if no_speech_prob > NO_SPEECH_PROB_MAX:
             return await drop("AI_FILTER", f"no_speech_prob={no_speech_prob:.2f} > {NO_SPEECH_PROB_MAX}")
+
+        if segment_purity < SEGMENT_PURITY_MIN:
+            return await drop("AI_FILTER", f"segment_purity={segment_purity:.2f} < {SEGMENT_PURITY_MIN}")
+
+        if PURE_SPEECH_MODE and method == "yamnet_unavailable":
+            return await drop("AI_FILTER", "PURE_SPEECH_MODE requires YAMNet for background-music gate")
+
+        if effect_detected:
+            return await drop("AI_FILTER", f"sound_effect_detected ({effect_label})")
+
+        if PURE_SPEECH_MODE and music_ratio > 0.0:
+            return await drop("AI_FILTER", f"background_music_detected music_ratio={music_ratio:.2f}")
 
         if music_ratio > MUSIC_RATIO_MAX:
             return await drop("AI_FILTER", f"music_ratio={music_ratio:.2f} > {MUSIC_RATIO_MAX} (YAMNet)")
@@ -548,7 +600,7 @@ class AudioPipeline:
         audio.ai_score     = audio_score
         audio.speech_ratio = speech_ratio
         audio.reason       = (
-            f"✅ speech={speech_ratio:.0%} music={music_ratio:.0%} "
+            f"✅ speech={speech_ratio:.0%} purity={segment_purity:.0%} music={music_ratio:.0%} "
             f"usage={usage:,} score={audio_score:.1f} tag={trend_tag} method={method}"
         )
 
@@ -567,7 +619,9 @@ class AudioPipeline:
         )
 
         if on_accepted:
-            on_accepted(audio)
+            res = on_accepted(audio)
+            if asyncio.iscoroutine(res):
+                await res
 
         # ── [11] EXPAND ────────────────────────────────────────────────────
         await self._maybe_expand_creator(audio)

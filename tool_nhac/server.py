@@ -13,6 +13,7 @@ import json
 import sys
 import re
 import subprocess
+import os
 import aiosqlite
 import warnings
 import logging
@@ -30,6 +31,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from telegram_notifier import notify_result as _telegram_notify_result, is_configured as _telegram_is_configured
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -41,11 +43,19 @@ BASE_DIR      = Path(__file__).parent
 FYP_DIR       = BASE_DIR.parent / "tool_sroll_feed"
 FYP_MAIN      = FYP_DIR / "main.py"
 TOOL_NHAC_DB  = BASE_DIR / "data" / "database" / "audio_automation.db"
-TOOL_FYP_DB   = FYP_DIR / "tiktok_audio.db"
 
 # Đảm bảo tool_nhac được tìm thấy khi import
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+# Import normalize_source để chuẩn hóa source_type toàn hệ thống
+try:
+    from models import normalize_source, SOURCE_CREATOR, SOURCE_FYP, SOURCE_KEYWORD
+except Exception:
+    def normalize_source(s): return s or "keyword"
+    SOURCE_CREATOR = "creator"
+    SOURCE_FYP = "fyp"
+    SOURCE_KEYWORD = "keyword"
 
 # Import run_crawler ở module level — tránh lazy import fail silently
 try:
@@ -76,6 +86,8 @@ _fyp_reader_task:     Optional[asyncio.Task] = None
 _follow_reader_task:  Optional[asyncio.Task] = None
 _expander_task:       Optional[asyncio.Task] = None
 _recheck_task:        Optional[asyncio.Task] = None
+_scanner_task:        Optional[asyncio.Task] = None
+_strict_recheck_task: Optional[asyncio.Task] = None
 _recheck_interval:    int   = 360  # phút — chạy background recheck mỗi 6 tiếng
 
 # Chuông báo cho Phase 3 (V2.2 Smart Pipeline)
@@ -120,22 +132,30 @@ def _on_nhac_log(data):
     else:
         asyncio.get_event_loop().create_task(_broadcast(data))
 
+def _build_result_entry(row, origin="tool_nhac") -> dict:
+    """Chuẩn hóa 1 row thành result entry với đầy đủ field."""
+    _g = lambda key, default="": (row.get(key) if isinstance(row, dict) else getattr(row, key, default)) or default
+    raw_source = _g("source_type", "") or _g("source", "keyword")
+    return {
+        "audio_id":         _g("audio_id"),
+        "audio_name":       _g("audio_name") or "Unknown",
+        "creator_username": _g("author_username") or _g("creator_username") or _g("creator", ""),
+        "usage_count":      int(_g("usage_count", 0) or 0),
+        "audio_page_url":   _g("audio_page_url") or _g("audio_link", ""),
+        "video_url":        _g("video_url") or _g("video_link", ""),
+        "ai_score":         round(float(_g("ai_score", 0) or 0), 2),
+        "speech_ratio":     round(float(_g("speech_ratio", 0) or 0) * 100),
+        "source":           normalize_source(raw_source),
+        "status":           _g("status") or "accepted",
+        "reason":           _g("reason", ""),
+        "date_added":       _g("date_added", ""),
+        "origin":           origin,
+    }
+
 def _on_nhac_result(row):
     global _results, _session_count
-    audio_id = row.get("audio_id", "") if isinstance(row, dict) else getattr(row, "audio_id", "")
-    entry = {
-        "audio_id":       audio_id,
-        "audio_name":     (row.get("audio_name") if isinstance(row, dict) else getattr(row, "audio_name", "")) or "Unknown",
-        "usage_count":    int((row.get("usage_count") if isinstance(row, dict) else getattr(row, "usage_count", 0)) or 0),
-        "audio_page_url": (row.get("audio_page_url") if isinstance(row, dict) else getattr(row, "audio_page_url", "")) or "",
-        "video_url":      (row.get("video_url") if isinstance(row, dict) else getattr(row, "video_url", "")) or "",
-        "ai_score":       round(float((row.get("ai_score") if isinstance(row, dict) else getattr(row, "ai_score", 0)) or 0), 2),
-        "speech_ratio":   round(float((row.get("speech_ratio") if isinstance(row, dict) else getattr(row, "speech_ratio", 0)) or 0) * 100),
-        "source":         (row.get("source_type") if isinstance(row, dict) else getattr(row, "source_type", "keyword")) or "keyword",
-        "status":         (row.get("status") if isinstance(row, dict) else getattr(row, "status", "accepted")) or "accepted",
-        "date_added":     (row.get("date_added") if isinstance(row, dict) else getattr(row, "date_added", "")) or "",
-        "origin":         "tool_nhac",
-    }
+    entry = _build_result_entry(row, origin="tool_nhac")
+    audio_id = entry["audio_id"]
     if not any(r["audio_id"] == audio_id for r in _results):
         _results.insert(0, entry)
         _results.sort(key=lambda x: x["usage_count"], reverse=True)
@@ -143,6 +163,7 @@ def _on_nhac_result(row):
     asyncio.get_event_loop().create_task(
         _broadcast({"type": "result", "data": entry, "total": _session_count, "target": _target})
     )
+    asyncio.get_event_loop().create_task(_telegram_notify_result(entry))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOL_NHAC RUNNER (chạy trong cùng event loop - không giới hạn target)
@@ -276,7 +297,7 @@ async def _fyp_log_streamer():
                             data = json.loads(line[12:])
                             entry = {
                                 "audio_id":       data.get("audio_id", ""),
-                                "audio_name":     data.get("audio_name", "FYP Audio"),
+                                "audio_name":     data.get("audio_name") or data.get("audio_id") or "Unknown Audio",
                                 "usage_count":    data.get("usage_count", 0),
                                 "audio_page_url": data.get("audio_link", ""),
                                 "video_url":      data.get("video_link", ""),
@@ -293,6 +314,7 @@ async def _fyp_log_streamer():
                             
                             # Broadcast result to update UI
                             await _broadcast({"type": "result", "data": entry, "total": _session_count, "target": _target})
+                            asyncio.get_event_loop().create_task(_telegram_notify_result({**entry, "status": "accepted"}))
                         except Exception as e:
                             print(f"Lỗi parse RESULT_JSON từ FYP: {e}")
                     else:
@@ -303,7 +325,7 @@ async def _fyp_log_streamer():
                 pass
 
 async def _follow_log_streamer():
-    """Stream stdout của Auto Follower chung vào fyp log window."""
+    """Stream stdout cua Auto Follower vao Auto Nurture log."""
     while True:
         await asyncio.sleep(0.3)
         if _follow_proc and _follow_proc.stdout:
@@ -311,9 +333,9 @@ async def _follow_log_streamer():
                 line = _follow_proc.stdout.readline()
                 if line:
                     line = line.strip()
-                    _fyp_log.append("[FOLLOW] " + line)
-                    if len(_fyp_log) > MAX_LOG: _fyp_log.pop(0)
-                    await _broadcast({"type": "log", "source": "follow", "msg": "[FOLLOW] " + line})
+                    _follow_log.append(line)
+                    if len(_follow_log) > MAX_LOG: _follow_log.pop(0)
+                    await _broadcast({"type": "log", "source": "follow", "msg": line})
             except Exception:
                 pass
 
@@ -321,64 +343,66 @@ async def _follow_log_streamer():
 # DB LOADER (đọc kết quả từ cả 2 DB)
 # ══════════════════════════════════════════════════════════════════════════════
 async def _load_all_results() -> list:
+    """
+    Load kết quả từ DB.
+    Chiến lược: load TẤT CẢ accepted (không giới hạn), rồi load pending/rejected
+    gần nhất (LIMIT 1500) để tránh bỏ sót audio đã đạt.
+    """
     results = []
 
     if TOOL_NHAC_DB.exists():
         try:
             async with aiosqlite.connect(str(TOOL_NHAC_DB), timeout=10) as db:
                 db.row_factory = aiosqlite.Row
+
+                def _row_to_dict(row):
+                    keys = row.keys()
+                    raw_source = row["source_type"] if "source_type" in keys else "keyword"
+                    source_db = row["source_db"] if "source_db" in keys else ""
+                    origin = "tool_sroll" if raw_source == "fyp" or source_db == "tool_sroll_feed" else "tool_nhac"
+                    return {
+                        "audio_id":         row["audio_id"],
+                        "audio_name":       row["audio_name"] or "Unknown",
+                        "creator_username": row["author_username"] if "author_username" in keys else "",
+                        "usage_count":      row["usage_count"] or 0,
+                        "audio_page_url":   row["audio_page_url"] or "",
+                        "video_url":        row["video_url"] if "video_url" in keys else "",
+                        "ai_score":         round(float(row["ai_score"] or 0), 2) if "ai_score" in keys else 0,
+                        "speech_ratio":     round(float(row["speech_ratio"] or 0) * 100) if "speech_ratio" in keys else 0,
+                        "source":           normalize_source(raw_source),
+                        "status":           row["status"] if "status" in keys else "accepted",
+                        "reason":           row["reason"] if "reason" in keys else "",
+                        "date_added":       row["date_added"] if "date_added" in keys else "",
+                        "origin":           origin,
+                    }
+
+                # Bước 1: Load TOÀN BỘ audio đã đạt (không giới hạn số lượng)
                 async with db.execute(
-                    "SELECT * FROM audio_history WHERE status IN ('accepted', 'pending_ai') ORDER BY date_added DESC LIMIT 2000"
+                    "SELECT * FROM audio_history WHERE status = 'accepted' ORDER BY usage_count DESC"
                 ) as cur:
                     async for row in cur:
-                        keys = row.keys()
-                        source = row["source_type"] if "source_type" in keys else "keyword"
-                        if source == "creator_scan": source = "profile"
-                        
-                        results.append({
-                            "audio_id":       row["audio_id"],
-                            "audio_name":     row["audio_name"] or "Unknown",
-                            "usage_count":    row["usage_count"] or 0,
-                            "audio_page_url": row["audio_page_url"] or "",
-                            "video_url":      row["video_url"] if "video_url" in keys else "",
-                            "ai_score":       round(float(row["ai_score"] or 0), 2) if "ai_score" in keys else 0,
-                            "speech_ratio":   round(float(row["speech_ratio"] or 0) * 100) if "speech_ratio" in keys else 0,
-                            "source":         source,
-                            "status":         row["status"] if "status" in keys else "accepted",
+                        results.append(_row_to_dict(row))
 
-                            "date_added":     row["date_added"] if "date_added" in keys else "",
-                            "origin":         "tool_nhac",
-                        })
+                # Bước 2: Load các trạng thái đang xử lý + rejected gần nhất
+                async with db.execute(
+                    """SELECT * FROM audio_history
+                       WHERE status IN ('pending', 'pending_ai', 'pending_ai_recheck', 'pending_usage_check',
+                                        'rejected', 'download_failed', 'ai_processing')
+                       ORDER BY date_added DESC LIMIT 1500"""
+                ) as cur:
+                    async for row in cur:
+                        results.append(_row_to_dict(row))
+
         except Exception as e:
             print(f"⚠️ Lỗi đọc tool_nhac DB: {e}")
 
-    if TOOL_FYP_DB.exists():
-        try:
-            async with aiosqlite.connect(str(TOOL_FYP_DB), timeout=10) as db:
-                db.row_factory = aiosqlite.Row
-                async with db.execute(
-                    "SELECT * FROM audiorecord WHERE status='passed' ORDER BY created_at DESC LIMIT 2000"
-                ) as cur:
-                    async for row in cur:
-                        keys = row.keys()
-                        results.append({
-                            "audio_id":       row["audio_id"],
-                            "audio_name":     row["audio_name"] if "audio_name" in keys else "FYP Audio",
-                            "usage_count":    row["usage_count"] or 0,
-                            "audio_page_url": row["audio_link"] if "audio_link" in keys else "",
-                            "video_url":      row["original_video_link"] if "original_video_link" in keys else "",
-                            "ai_score":       0,
-                            "speech_ratio":   0,
-                            "source":         "fyp",
-                            "status":         "pending_ai",
-                            "date_added":     str(row["created_at"]) if "created_at" in keys else "",
-                            "origin":         "tool_sroll",
-                        })
-        except Exception as e:
-            print(f"⚠️ Lỗi đọc FYP DB: {e}")
+    # Sắp xếp: accepted trước (theo usage_count), sau đó mới đến các status khác
+    accepted_rows = [r for r in results if r["status"] == "accepted"]
+    other_rows    = [r for r in results if r["status"] != "accepted"]
+    other_rows.sort(key=lambda x: x.get("date_added", ""), reverse=True)
 
     seen, deduped = set(), []
-    for r in sorted(results, key=lambda x: x["usage_count"], reverse=True):
+    for r in accepted_rows + other_rows:
         if r["audio_id"] not in seen:
             seen.add(r["audio_id"])
             deduped.append(r)
@@ -386,17 +410,21 @@ async def _load_all_results() -> list:
 
 def _get_stats() -> dict:
     by_src: dict = {}
+    by_status: dict = {}
     fyp = nhac = 0
     for r in _results:
-        s = r.get("source", "keyword")
+        s = normalize_source(r.get("source", "keyword"))
         by_src[s] = by_src.get(s, 0) + 1
-        if r["origin"] == "tool_sroll": fyp += 1
+        st = r.get("status", "accepted")
+        by_status[st] = by_status.get(st, 0) + 1
+        if r.get("origin") == "tool_sroll": fyp += 1
         else: nhac += 1
-    # V2.1: thêm source mới
     return {
         "total": len(_results), "fyp": fyp, "nhac": nhac,
         "by_source": by_src,
-        "profile": by_src.get("profile", 0),
+        "by_status": by_status,
+        "creator": by_src.get("creator", 0),
+        "profile": by_src.get("creator", 0),  # backward compat
         "hot_trend": sum(1 for r in _results if r.get("trend_tag") in ("HOT_TREND", "EARLY_TREND")),
     }
 
@@ -422,12 +450,23 @@ async def lifespan(app: FastAPI):
     print("  🎵 TikTok Audio Dashboard — All-in-One")
     print("  http://localhost:8000")
     print("═"*60)
+    try:
+        from shutil import which
+        local_ytdlp = BASE_DIR / "yt-dlp.exe"
+        if not local_ytdlp.exists() and not which("yt-dlp"):
+            _emit_log("⚠️ Không thấy yt-dlp. Cài `pip install yt-dlp` để Phase 3 tải TikTok ổn định hơn.", "nhac")
+    except Exception:
+        pass
 
     # Nạp kết quả từ cả 2 DB
     _results = await _load_all_results()
     stats = _get_stats()
     print(f"  📊 Đã nạp {stats['total']} kết quả (tool_nhac: {stats['nhac']}, FYP: {stats['fyp']}, Profile: {stats['profile']})")
     print(f"  📋 Danh sách creator: {_creators_count()} kênh")
+    if _telegram_is_configured():
+        _emit_log("Telegram realtime notifier đã bật.", "nhac")
+    else:
+        _emit_log("Telegram realtime notifier đang tắt. Thêm TELEGRAM_BOT_TOKEN và TELEGRAM_CHAT_ID để bật.", "nhac")
 
     # Khởi động FYP log streamer
     _fyp_reader_task = asyncio.get_event_loop().create_task(_fyp_log_streamer())
@@ -438,9 +477,10 @@ async def lifespan(app: FastAPI):
     # _recheck_task = asyncio.get_event_loop().create_task(_auto_recheck_loop())
     _recheck_task = None
 
-    # Khởi động AI Check Worker (Phase 3)
     global _ai_worker_task
     _ai_worker_task = asyncio.get_event_loop().create_task(_ai_check_worker())
+    _ai_wakeup.set()
+    _emit_log("🤖 Phase 3 worker tự khởi động và sẽ xử lý pending_ai còn tồn.", "nhac")
 
     print("  ✅ Dashboard sẵn sàng — Bấm nút trên web để bắt đầu các tool")
     print("═"*60 + "\n")
@@ -452,7 +492,7 @@ async def lifespan(app: FastAPI):
     if _stop_event: _stop_event.set()
     
     # Cố gắng đóng các task êm ái
-    tasks = [t for t in [_nhac_task, _fyp_reader_task, _follow_reader_task, _expander_task, _recheck_task, _ai_worker_task] if t and not t.done()]
+    tasks = [t for t in [_nhac_task, _fyp_reader_task, _follow_reader_task, _expander_task, _recheck_task, _ai_worker_task, _scanner_task, _strict_recheck_task] if t and not t.done()]
     for t in tasks: t.cancel()
     
     _stop_fyp_proc()
@@ -493,8 +533,16 @@ async def nhac_stop():
     return {"ok": True, "msg": "tool_nhac đã dừng"}
 
 # ── REST: FYP tool control ─────────────────────────────────────────────────────
+def _ensure_ai_worker_started():
+    global _ai_worker_task
+    if _ai_worker_task is None or _ai_worker_task.done():
+        _ai_worker_task = asyncio.get_event_loop().create_task(_ai_check_worker())
+        _emit_log("🤖 Phase 3 FYP worker đã bật.", "nhac")
+
+
 @app.post("/fyp/start")
 async def fyp_start_api():
+    _ensure_ai_worker_started()
     ok, msg = _start_fyp_proc() if not _fyp_running() else (False, "Đang chạy rồi")
     await _broadcast({"type": "fyp_status", "status": _fyp_status_str(), "msg": msg})
     return {"ok": ok, "msg": msg}
@@ -510,6 +558,66 @@ async def fyp_stop_api():
 async def fyp_status_api():
     return {"status": _fyp_status_str(), "running": _fyp_running()}
 
+async def _persist_fyp_result(body: dict) -> None:
+    audio_id = body.get("audio_id", "")
+    if not audio_id:
+        return
+
+    created_at = body.get("date_added") or body.get("created_at") or ""
+    status = body.get("status") or "pending_ai"
+    if status == "passed":
+        status = "pending_ai"
+    source = normalize_source(body.get("source", "fyp"))
+    if source != "creator":
+        source = "fyp"
+
+    async with aiosqlite.connect(str(TOOL_NHAC_DB), timeout=30) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(
+            """
+            INSERT INTO audio_history (
+                audio_id, audio_name, duration, usage_count, audio_url,
+                audio_page_url, video_url, keyword, status, reason,
+                date_added, ai_score, speech_ratio, source_type,
+                author_username, source_db, source_status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(audio_id) DO UPDATE SET
+                audio_name = COALESCE(NULLIF(audio_history.audio_name, ''), excluded.audio_name),
+                duration = COALESCE(audio_history.duration, excluded.duration),
+                usage_count = MAX(COALESCE(audio_history.usage_count, 0), COALESCE(excluded.usage_count, 0)),
+                audio_url = COALESCE(NULLIF(audio_history.audio_url, ''), excluded.audio_url),
+                audio_page_url = COALESCE(NULLIF(audio_history.audio_page_url, ''), excluded.audio_page_url),
+                video_url = COALESCE(NULLIF(audio_history.video_url, ''), excluded.video_url),
+                keyword = COALESCE(NULLIF(audio_history.keyword, ''), excluded.keyword),
+                reason = COALESCE(NULLIF(audio_history.reason, ''), excluded.reason),
+                source_type = COALESCE(NULLIF(audio_history.source_type, ''), excluded.source_type),
+                author_username = COALESCE(NULLIF(audio_history.author_username, ''), excluded.author_username),
+                source_db = COALESCE(NULLIF(audio_history.source_db, ''), excluded.source_db),
+                source_status = COALESCE(NULLIF(audio_history.source_status, ''), excluded.source_status)
+            """,
+            (
+                audio_id,
+                body.get("audio_name") or audio_id,
+                int(body.get("duration", 0) or 0),
+                int(body.get("usage_count", 0) or 0),
+                body.get("audio_url") or body.get("audio_link", ""),
+                body.get("audio_page_url") or body.get("audio_link", ""),
+                body.get("video_url") or body.get("video_link", ""),
+                "fyp",
+                status,
+                body.get("reason", ""),
+                created_at,
+                float(body.get("ai_score", 0) or 0),
+                float(body.get("speech_ratio", 0) or 0),
+                source,
+                body.get("creator_username", ""),
+                "tool_sroll_feed",
+                body.get("status", status),
+            ),
+        )
+        await db.commit()
+
 @app.post("/fyp/result")
 async def fyp_result_api(body: dict):
     """
@@ -522,21 +630,22 @@ async def fyp_result_api(body: dict):
         if not audio_id:
             return {"ok": False, "msg": "Missing audio_id"}
 
-        source = body.get("source", "fyp")
-        if source == "creator_scan": source = "profile"
+        source = normalize_source(body.get("source", "fyp"))
 
         entry = {
-            "audio_id":       audio_id,
-            "audio_name":     body.get("audio_name", "FYP Audio"),
-            "usage_count":    int(body.get("usage_count", 0) or 0),
-            "audio_page_url": body.get("audio_link", ""),
-            "video_url":      body.get("video_link", ""),
-            "ai_score":       0,
-            "speech_ratio":   0,
-            "source":         source,
-            "status":         "pending_ai",
-            "date_added":     body.get("created_at", ""),
-            "origin":         "tool_sroll",
+            "audio_id":         audio_id,
+            "audio_name":       body.get("audio_name") or body.get("audio_id") or "Unknown",
+            "usage_count":      int(body.get("usage_count", 0) or 0),
+            "audio_page_url":   body.get("audio_page_url") or body.get("audio_link", ""),
+            "video_url":        body.get("video_url") or body.get("video_link", ""),
+            "creator_username": body.get("creator_username", ""),
+            "ai_score":         body.get("ai_score", 0) or 0,
+            "speech_ratio":     body.get("speech_ratio", 0) or 0,
+            "source":           source,
+            "status":           body.get("status", "pending_ai"),
+            "reason":           body.get("reason", ""),
+            "date_added":       body.get("date_added") or body.get("created_at", ""),
+            "origin":           "tool_nhac" if source == "creator" else "tool_sroll",
         }
 
 
@@ -544,11 +653,16 @@ async def fyp_result_api(body: dict):
             _results.insert(0, entry)
             _results.sort(key=lambda x: x["usage_count"], reverse=True)
 
+        await _persist_fyp_result(body)
+
         _session_count += 1
         await _broadcast({"type": "result", "data": entry, "total": _session_count, "target": _target})
+        asyncio.get_event_loop().create_task(_telegram_notify_result(entry))
         
         # [V2.2 Smart] Đánh thức Phase 3 dậy làm việc ngay
-        _ai_wakeup.set()
+        if source != "creator":
+            _ensure_ai_worker_started()
+            _ai_wakeup.set()
         
         return {"ok": True}
     except Exception as e:
@@ -799,6 +913,7 @@ async def audio_check_single(body: dict):
                     }
                     _results.insert(0, row)
                     asyncio.get_event_loop().create_task(_broadcast({"type": "result", "data": row}))
+                    asyncio.get_event_loop().create_task(_telegram_notify_result(row))
 
                 result = await pipeline.process(audio, on_accepted=_on_acc)
                 if not result.passed:
@@ -829,16 +944,23 @@ async def save_keywords(body: dict):
 @app.post("/follow/start")
 async def start_follow(req: Request):
     data = await req.json()
-    target = data.get("target", "")
-    max_follows = int(data.get("max", 200))
+    target = (data.get("target", "") or "").strip()
+    try:
+        max_follows = int(data.get("max", 200))
+    except Exception:
+        max_follows = 200
+    max_follows = max(1, min(max_follows, 200))
     if not target:
         return {"ok": False, "msg": "Thiếu target username"}
+    _follow_log.clear()
     ok, msg = _start_follow_proc(target, max_follows)
+    _emit_log(msg, "follow")
     return {"ok": ok, "msg": msg}
 
 @app.post("/follow/stop")
 async def stop_follow():
     ok, msg = _stop_follow_proc()
+    _emit_log(msg, "follow")
     return {"ok": ok, "msg": msg}
 
 # ── V2.1: Channel Expander API ─────────────────────────────────────────────────
@@ -879,6 +1001,265 @@ async def expander_status():
     return {"running": running, "creators_count": _creators_count()}
 
 
+@app.post("/telegram/test")
+async def telegram_test():
+    from datetime import datetime
+
+    if not _telegram_is_configured():
+        return {
+            "ok": False,
+            "msg": "Thiếu TELEGRAM_BOT_TOKEN và TELEGRAM_CHAT_ID/TELEGRAM_CHAT_IDS trong môi trường."
+        }
+    sample = {
+        "audio_id": f"telegram-test-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "audio_name": "Telegram Test Notification",
+        "creator_username": "system",
+        "usage_count": 12345,
+        "ai_score": 99.0,
+        "speech_ratio": 100,
+        "audio_page_url": "https://www.tiktok.com/music/test",
+        "video_url": "",
+        "source": "system_test",
+        "status": "accepted",
+        "reason": "Manual test",
+    }
+    try:
+        await _telegram_notify_result(sample)
+        return {"ok": True, "msg": "Đã gửi test Telegram."}
+    except Exception as e:
+        return {"ok": False, "msg": f"Lỗi gửi Telegram: {e}"}
+
+
+# ── Pending Checker API ────────────────────────────────────────────────────────
+_pending_check_task: Optional[asyncio.Task] = None
+_pending_check_log:  list = []
+
+def _pending_emit(msg: str):
+    _pending_check_log.append(msg)
+    if len(_pending_check_log) > 500:
+        _pending_check_log.pop(0)
+    _emit_log(msg, "pending")
+
+async def _run_pending_check_job(min_usage: int = 500):
+    """
+    Job kiểm tra lại usage thực tế của tất cả audio có status='pending'.
+    Dùng HTTP API nhẹ (không cần browser).
+    Kết quả:
+      - usage >= min_usage  → status = 'pending_ai' (đưa vào hàng đợi AI)
+      - usage < min_usage   → status = 'rejected'
+      - fetch thất bại      → giữ nguyên pending (thử lại sau)
+    """
+    global _pending_check_task, _results
+
+    from playwright.async_api import async_playwright
+    from crawler import TikTokCrawler
+    from playwright_stealth import Stealth
+    from filter import get_dynamic_min_usage
+
+    _pending_emit(f"🔍 [Pending Checker] Bắt đầu kiểm tra audio pending (ngưỡng tối thiểu: {min_usage:,} LSD)...")
+
+    try:
+        import aiosqlite
+        # Lấy danh sách pending từ DB
+        async with aiosqlite.connect(str(TOOL_NHAC_DB), timeout=15) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT audio_id, audio_name, usage_count, create_time, audio_page_url,
+                          video_url, author_username, source_type, date_added
+                   FROM audio_history
+                   WHERE status IN ('pending', 'pending_usage_check')
+                   ORDER BY date_added ASC"""
+            ) as cur:
+                pending_rows = [dict(row) for row in await cur.fetchall()]
+
+        if not pending_rows:
+            _pending_emit("✅ Không có audio nào đang ở trạng thái 'pending'.")
+            return
+
+        _pending_emit(f"📋 Tìm thấy {len(pending_rows)} audio cần kiểm tra...")
+
+        stats = {"checked": 0, "passed": 0, "rejected": 0, "failed": 0}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=False,
+                args=[
+                    "--mute-audio",
+                    "--disable-dev-shm-usage",
+                    "--disable-features=Translate,OptimizationHints,MediaRouter",
+                    "--disable-background-networking",
+                ]
+            )
+            crawler_bg = TikTokCrawler()
+            
+            try:
+                for row in pending_rows:
+                    audio_id    = row["audio_id"]
+                    audio_name  = row["audio_name"] or "?"
+                    old_usage   = row["usage_count"] or 0
+                    create_time = row["create_time"] or 0
+                    audio_page_url = row.get("audio_page_url")
+
+                    # Tính ngưỡng động theo năm tạo
+                    threshold = get_dynamic_min_usage(create_time) if create_time > 0 else min_usage
+
+                    # Fetch usage thực từ API TikTok dùng browser
+                    real_usage = 0
+                    if not audio_page_url:
+                        audio_page_url = f"https://www.tiktok.com/music/x-{audio_id}"
+                        
+                    ctx = await browser.new_context(viewport={"width": 1280, "height": 800})
+                    page = await ctx.new_page()
+                    try:
+                        await Stealth().apply_stealth_async(page)
+                        await page.route(
+                            "**/*",
+                            lambda route: route.abort()
+                            if route.request.resource_type in ["image", "media", "font"]
+                            else route.continue_()
+                        )
+                        real_usage = await crawler_bg.get_accurate_usage(audio_page_url, page=page)
+                        
+                        if real_usage == 0:
+                            # Đôi khi lỗi load
+                            _pending_emit(f"  ⚠️ [{audio_id}] Usage = 0, có thể lỗi load.")
+                            stats["failed"] += 1
+                            continue
+                            
+                    except Exception as e:
+                        _pending_emit(f"  ⚠️ [{audio_id}] Lỗi browser: {e}")
+                        stats["failed"] += 1
+                        continue
+                    finally:
+                        await page.close()
+                        await ctx.close()
+
+                    stats["checked"] += 1
+
+                    if real_usage >= threshold:
+                        new_status = "pending_ai"
+                        stats["passed"] += 1
+                        _pending_emit(
+                            f"  ✅ [{audio_id}] '{audio_name[:25]}' usage={real_usage:,} >= {threshold:,} → pending_ai"
+                        )
+                        # Đánh thức Phase 3 worker
+                        _ai_wakeup.set()
+                    else:
+                        new_status = "rejected"
+                        stats["rejected"] += 1
+                        _pending_emit(
+                            f"  ❌ [{audio_id}] '{audio_name[:25]}' usage={real_usage:,} < {threshold:,} → rejected"
+                        )
+
+                    # Cập nhật DB
+                    async with aiosqlite.connect(str(TOOL_NHAC_DB), timeout=15) as db:
+                        await db.execute(
+                        "UPDATE audio_history SET status=?, usage_count=?, reason=? WHERE audio_id=?",
+                        (
+                            new_status,
+                            real_usage if real_usage > 0 else old_usage,
+                            f"LSD recheck: usage={real_usage:,}, threshold={threshold:,}",
+                            audio_id,
+                        )
+                    )
+                        await db.commit()
+
+                    # Cập nhật _results trong bộ nhớ
+                    for r in _results:
+                        if r.get("audio_id") == audio_id:
+                            r["status"]      = new_status
+                            r["usage_count"] = real_usage if real_usage > 0 else old_usage
+                            r["reason"]      = f"LSD recheck: usage={real_usage:,}, threshold={threshold:,}"
+                            r["source"]      = normalize_source(row.get("source_type", r.get("source", "keyword")))
+                            r["creator_username"] = row.get("author_username", r.get("creator_username", ""))
+                            r["audio_page_url"] = row.get("audio_page_url", r.get("audio_page_url", ""))
+                            r["video_url"] = row.get("video_url", r.get("video_url", ""))
+                            r["date_added"] = row.get("date_added", r.get("date_added", ""))
+                            break
+
+                    await _broadcast({
+                        "type": "result",
+                        "data": {
+                            "audio_id":   audio_id,
+                            "audio_name": audio_name,
+                            "usage_count": real_usage if real_usage > 0 else old_usage,
+                            "audio_page_url": row.get("audio_page_url", ""),
+                            "video_url": row.get("video_url", ""),
+                            "creator_username": row.get("author_username", ""),
+                            "reason": f"LSD recheck: usage={real_usage:,}, threshold={threshold:,}",
+                            "date_added": row.get("date_added", ""),
+                            "status":     new_status,
+                            "source":     normalize_source(row.get("source_type", "keyword")),
+                        }
+                    })
+
+                    await asyncio.sleep(1.2)  # Anti rate-limit
+
+            finally:
+                await browser.close()
+
+        _pending_emit(
+            f"\n🏁 [Pending Checker] Hoàn tất! "
+            f"Checked={stats['checked']} | Passed→AI={stats['passed']} | "
+            f"Rejected={stats['rejected']} | Lỗi fetch={stats['failed']}"
+        )
+
+        # Reload results từ DB
+        _results = await _load_all_results()
+        await _broadcast({"type": "refresh", "total": len(_results), "stats": _get_stats()})
+
+    except asyncio.CancelledError:
+        _pending_emit("⏹ [Pending Checker] Đã dừng.")
+    except Exception as e:
+        import traceback
+        _pending_emit(f"❌ [Pending Checker] Lỗi: {e}")
+        _pending_emit(traceback.format_exc())
+    finally:
+        _pending_check_task = None
+
+
+@app.post("/pending/check")
+async def pending_check_start(body: dict = {}):
+    """Bắt đầu kiểm tra lại tất cả audio đang pending."""
+    global _pending_check_task
+    if _pending_check_task and not _pending_check_task.done():
+        return {"ok": False, "msg": "Pending Checker đang chạy rồi"}
+    min_usage = int(body.get("min_usage", 500))
+    _pending_check_log.clear()
+    _pending_check_task = asyncio.get_event_loop().create_task(_run_pending_check_job(min_usage))
+    return {"ok": True, "msg": f"Pending Checker đã khởi động (ngưỡng: {min_usage:,})"}
+
+
+@app.post("/pending/stop")
+async def pending_check_stop():
+    global _pending_check_task
+    if _pending_check_task and not _pending_check_task.done():
+        _pending_check_task.cancel()
+        _pending_check_task = None
+        return {"ok": True, "msg": "Đã dừng Pending Checker"}
+    return {"ok": False, "msg": "Không có job nào đang chạy"}
+
+
+@app.get("/pending/status")
+async def pending_check_status():
+    running = _pending_check_task is not None and not _pending_check_task.done()
+    # Đếm pending trong DB
+    count = 0
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(str(TOOL_NHAC_DB), timeout=5) as db:
+            async with db.execute("SELECT COUNT(*) FROM audio_history WHERE status IN ('pending', 'pending_usage_check')") as cur:
+                row = await cur.fetchone()
+                count = row[0] if row else 0
+    except Exception:
+        pass
+    return {
+        "running": running,
+        "pending_count": count,
+        "log": _pending_check_log[-50:],
+    }
+
+
 # ── V2.1: Background Recheck API ───────────────────────────────────────────────
 async def _auto_recheck_loop():
     """Chạy background recheck tự động mỗi _recheck_interval phút."""
@@ -903,6 +1284,192 @@ async def recheck_now():
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
+
+def _row_to_audio_metadata(data: dict):
+    from models import AudioMetadata
+
+    return AudioMetadata(
+        audio_id=data.get("audio_id", ""),
+        audio_name=data.get("audio_name", "") or "Unknown",
+        duration=int(data.get("duration", 0) or 0),
+        usage_count=int(data.get("usage_count", 0) or 0),
+        audio_url=data.get("audio_url", "") or "",
+        audio_page_url=data.get("audio_page_url", "") or "",
+        video_url=data.get("video_url", "") or "",
+        keyword=data.get("keyword", "") or "strict_recheck",
+        status=data.get("status", "pending_ai_recheck") or "pending_ai_recheck",
+        reason=data.get("reason", "") or "",
+        file_path=data.get("file_path"),
+        date_added=data.get("date_added", "") or "",
+        is_speech=bool(data["is_speech"]) if data.get("is_speech") is not None else None,
+        ai_score=data.get("ai_score"),
+        speech_ratio=float(data.get("speech_ratio", 0.0) or 0.0),
+        video_views=int(data.get("video_views", 0) or 0),
+        video_likes=int(data.get("video_likes", 0) or 0),
+        create_time=int(data.get("create_time", 0) or 0),
+        author_username=data.get("author_username", "") or "",
+        source_type=normalize_source(data.get("source_type", "keyword") or "keyword"),
+        scan_session_id=data.get("scan_session_id", "") or "",
+        scan_creator=data.get("scan_creator", "") or "",
+        phase=data.get("phase", "") or "",
+    )
+
+
+async def _run_strict_ai_recheck(limit: int = 0, source: str = "all"):
+    global _strict_recheck_task, _results
+
+    from audio_pipeline import AudioPipeline
+    from database import update_audio_record
+
+    _emit_log("🔁 [Strict AI Recheck] Bắt đầu quét lại audio accepted theo rule mới...", "nhac")
+    pipeline = AudioPipeline.get()
+
+    try:
+        clauses = ["status = 'accepted'"]
+        params = []
+        if source and source != "all":
+            clauses.append("source_type = ?")
+            params.append(source)
+
+        query = f"SELECT * FROM audio_history WHERE {' AND '.join(clauses)} ORDER BY usage_count DESC"
+        if limit and limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        picked = []
+        async with aiosqlite.connect(str(TOOL_NHAC_DB), timeout=15) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                picked = [dict(row) for row in await cur.fetchall()]
+
+        if not picked:
+            _emit_log("ℹ️ [Strict AI Recheck] Không có audio accepted nào để recheck.", "nhac")
+            return
+
+        _emit_log(f"🔁 [Strict AI Recheck] Đã chọn {len(picked)} audio để chạy lại AI.", "nhac")
+
+        for row in picked:
+            row["status"] = "pending_ai_recheck"
+            audio_id = row["audio_id"]
+
+            for r in _results:
+                if r.get("audio_id") == audio_id:
+                    r["status"] = "pending_ai"
+                    r["reason"] = "Strict AI recheck queued"
+                    break
+
+            await _broadcast({
+                "type": "result",
+                "data": {
+                    "audio_id": audio_id,
+                    "audio_name": row.get("audio_name", ""),
+                    "usage_count": row.get("usage_count", 0),
+                    "audio_page_url": row.get("audio_page_url", ""),
+                    "video_url": row.get("video_url", ""),
+                    "creator_username": row.get("author_username", ""),
+                    "status": "pending_ai",
+                    "reason": "Strict AI recheck queued",
+                    "source": normalize_source(row.get("source_type", "keyword")),
+                }
+            })
+
+            audio = _row_to_audio_metadata(row)
+            audio.status = "ai_processing"
+            audio.reason = "Strict AI recheck processing"
+            await update_audio_record(audio)
+
+            async def _on_accept(a):
+                row_ui = {
+                    "audio_id": a.audio_id,
+                    "audio_name": a.audio_name,
+                    "usage_count": a.usage_count,
+                    "audio_page_url": a.audio_page_url,
+                    "video_url": a.video_url,
+                    "creator_username": a.author_username,
+                    "ai_score": a.ai_score,
+                    "speech_ratio": round((a.speech_ratio or 0) * 100),
+                    "status": "accepted",
+                    "source": normalize_source(a.source_type or "keyword"),
+                    "reason": a.reason,
+                }
+                for rr in _results:
+                    if rr.get("audio_id") == a.audio_id:
+                        rr.update(row_ui)
+                        break
+                else:
+                    _results.insert(0, {**row_ui, "origin": "tool_nhac", "date_added": a.date_added})
+                asyncio.get_event_loop().create_task(_broadcast({"type": "result", "data": row_ui}))
+                # Thêm dòng này để bắn Telegram khi "Kiểm tra đơn lẻ"
+                asyncio.get_event_loop().create_task(_telegram_notify_result(row_ui))
+
+            try:
+                res = await asyncio.wait_for(pipeline.process(audio, on_accepted=_on_accept), timeout=90.0)
+                if not res.passed:
+                    reject_row = {
+                        "audio_id": audio.audio_id,
+                        "audio_name": audio.audio_name,
+                        "usage_count": audio.usage_count,
+                        "audio_page_url": audio.audio_page_url,
+                        "video_url": audio.video_url,
+                        "creator_username": audio.author_username,
+                        "status": audio.status if audio.status in ("download_failed", "ai_error") else "rejected",
+                        "reason": res.reason,
+                        "source": normalize_source(audio.source_type or "keyword"),
+                    }
+                    for rr in _results:
+                        if rr.get("audio_id") == audio.audio_id:
+                            rr.update(reject_row)
+                            break
+                    asyncio.get_event_loop().create_task(_broadcast({"type": "result", "data": reject_row}))
+                _emit_log(f"[Strict Recheck] {audio.audio_id} -> {audio.status}: {audio.reason}", "nhac")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                audio.status = "ai_error"
+                audio.reason = f"Strict recheck error: {e}"
+                await update_audio_record(audio)
+                _emit_log(f"[Strict Recheck] {audio.audio_id} -> ai_error: {e}", "nhac")
+
+        _emit_log("✅ [Strict AI Recheck] Hoàn thành.", "nhac")
+        _results = await _load_all_results()
+        await _broadcast({"type": "refresh", "total": len(_results), "stats": _get_stats()})
+
+    except asyncio.CancelledError:
+        _emit_log("⏹ [Strict AI Recheck] Đã dừng.", "nhac")
+        raise
+    except Exception as e:
+        import traceback as tb
+        _emit_log(f"❌ [Strict AI Recheck] Lỗi: {e}", "nhac")
+        _emit_log(tb.format_exc(), "nhac")
+    finally:
+        _strict_recheck_task = None
+
+
+@app.post("/ai/recheck-strict")
+async def ai_recheck_strict(body: dict = {}):
+    global _strict_recheck_task
+    if _strict_recheck_task and not _strict_recheck_task.done():
+        return {"ok": False, "msg": "Strict AI Recheck đang chạy rồi"}
+
+    limit = int(body.get("limit", 0) or 0)
+    source = normalize_source(body.get("source", "all")) if body.get("source", "all") != "all" else "all"
+    _strict_recheck_task = asyncio.get_event_loop().create_task(_run_strict_ai_recheck(limit=limit, source=source))
+    return {"ok": True, "msg": "Đã bắt đầu Strict AI Recheck"}
+
+
+@app.post("/ai/recheck-strict/stop")
+async def ai_recheck_strict_stop():
+    global _strict_recheck_task
+    if _strict_recheck_task and not _strict_recheck_task.done():
+        _strict_recheck_task.cancel()
+        return {"ok": True, "msg": "Đã gửi lệnh dừng Strict AI Recheck"}
+    return {"ok": False, "msg": "Strict AI Recheck hiện không chạy"}
+
+
+@app.get("/ai/recheck-strict/status")
+async def ai_recheck_strict_status():
+    return {"running": _strict_recheck_task is not None and not _strict_recheck_task.done()}
+
 # ── V2.1: PHASE 3 - AI Check Worker ───────────────────────────────────────────
 _ai_worker_task: Optional[asyncio.Task] = None
 
@@ -911,16 +1478,29 @@ async def _ai_check_worker():
     Worker chạy ngầm, liên tục quét DB tìm audio 'pending_ai' để xử lý.
     Đây chính là 'Phase 3' mà người dùng mong đợi.
     """
-    from database import get_pending_ai_audios, update_audio_ai_result
+    from database import get_pending_ai_audios, update_audio_record
+    import main
     from audio_pipeline import AudioPipeline
     
+    # Đảm bảo Semaphore đã được khởi tạo trong Event Loop hiện tại
+    main.init_semaphores()
+    
+    _emit_log("🤖 Phase 3 (AI Check Worker) đã sẵn sàng.", "miner")
+    
     pipeline = AudioPipeline.get()
-    _emit_log("🤖 Phase 3 (AI Check Worker) đã sẵn sàng.", "nhac")
+    backlog_mode = True
     
     while True:
         try:
-            pending = await get_pending_ai_audios(limit=5)
+            if backlog_mode:
+                pending = await get_pending_ai_audios(limit=5, source_filter=None)
+            else:
+                # Sau khi xử lý backlog cũ lúc boot xong, worker nền chỉ xử lý FYP.
+                pending = await get_pending_ai_audios(limit=5, source_filter=['fyp', 'tool_sroll'])
             if not pending:
+                if backlog_mode:
+                    backlog_mode = False
+                    _emit_log("🤖 Phase 3: đã quét xong backlog pending_ai khi khởi động.", "nhac")
                 # Log heartbeat mỗi 2 phút để xác nhận worker vẫn sống
                 import time as _t
                 if int(_t.time()) % 120 < 11:
@@ -938,53 +1518,77 @@ async def _ai_check_worker():
             _emit_log(f"🤖 [Phase 3] Đang xử lý AI cho {len(pending)} audio...", "nhac")
             
             async def _proc(audio):
-                try:
-                    _emit_log(f"🔍 AI Check: {audio.audio_name[:30]}...", "nhac")
-                    
-                    def _on_accept(a):
-                        _emit_log(f"✅ ĐẠT AI: {a.audio_name[:30]} (Speech: {round(a.speech_ratio*100)}%)", "nhac")
-                        # Cập nhật kết quả lên UI ngay lập tức
-                        row = {
-                            "audio_id":     a.audio_id,
-                            "audio_name":   a.audio_name,
-                            "usage_count":  a.usage_count,
-                            "ai_score":     a.ai_score,
-                            "speech_ratio": a.speech_ratio,
-                            "status":       "accepted",
-                            "source":       a.source_type or "profile",
-                        }
-                        # Cập nhật vào list _results tại chỗ
-                        for r in _results:
-                            if r["audio_id"] == a.audio_id:
-                                r.update(row)
-                                break
+                async with main.ai_semaphore:
+                    try:
+                        _emit_log(f"🔍 AI Check: {audio.audio_name[:30]}...", "nhac")
                         
-                        asyncio.get_event_loop().create_task(
-                            _broadcast({"type": "result", "data": row})
+                        def _on_accept(a):
+                            _emit_log(f"✅ ĐẠT AI: {a.audio_name[:30]} (Speech: {round(a.speech_ratio*100)}%)", "nhac")
+                            # Cập nhật kết quả lên UI ngay lập tức
+                            row = {
+                                "audio_id":         a.audio_id,
+                                "audio_name":       a.audio_name,
+                                "usage_count":      a.usage_count,
+                                "audio_page_url":   a.audio_page_url,
+                                "video_url":        a.video_url,
+                                "creator_username": a.author_username,
+                                "ai_score":         a.ai_score,
+                                "speech_ratio":     round((a.speech_ratio or 0) * 100),
+                                "status":           "accepted",
+                                "source":           normalize_source(a.source_type or "keyword"),
+                                "reason":           a.reason,
+                            }
+                            # Cập nhật vào list _results tại chỗ
+                            for r in _results:
+                                if r["audio_id"] == a.audio_id:
+                                    r.update(row)
+                                    break
+                            else:
+                                _results.insert(0, {**row, "origin": "tool_nhac", "date_added": a.date_added})
+                            
+                            asyncio.get_event_loop().create_task(
+                                _broadcast({"type": "result", "data": row})
+                            )
+                            asyncio.get_event_loop().create_task(_telegram_notify_result(row))
+                        
+                        # Giới hạn 60s cho mỗi audio
+                        pipeline_res = await asyncio.wait_for(
+                            pipeline.process(audio, on_accepted=_on_accept),
+                            timeout=60.0
                         )
-                    
-                    # Giới hạn 60s cho mỗi audio
-                    pipeline_res = await asyncio.wait_for(
-                        pipeline.process(audio, on_accepted=_on_accept),
-                        timeout=60.0
-                    )
-                    
-                    if not pipeline_res.passed:
-                        _emit_log(f"❌ LOẠI AI: {audio.audio_name[:30]} | Lý do: {pipeline_res.reason}", "nhac")
-                        # Cập nhật status rejected về UI để nó biến mất khỏi bảng "Chờ"
-                        row = {"audio_id": audio.audio_id, "status": "rejected", "reason": pipeline_res.reason}
-                        asyncio.get_event_loop().create_task(_broadcast({"type": "result", "data": row}))
+                        
+                        if not pipeline_res.passed:
+                            _emit_log(f"❌ LOẠI AI: {audio.audio_name[:30]} | Lý do: {pipeline_res.reason}", "nhac")
+                            # Cập nhật status rejected về UI để nó biến mất khỏi bảng "Chờ"
+                            row = {
+                                "audio_id": audio.audio_id,
+                                "audio_name": audio.audio_name,
+                                "usage_count": audio.usage_count,
+                                "audio_page_url": audio.audio_page_url,
+                                "video_url": audio.video_url,
+                                "creator_username": audio.author_username,
+                                "status": audio.status if audio.status in ("download_failed", "ai_error") else "rejected",
+                                "reason": pipeline_res.reason,
+                                "source": normalize_source(audio.source_type or "keyword"),
+                            }
+                            for r in _results:
+                                if r["audio_id"] == audio.audio_id:
+                                    r.update(row)
+                                    break
+                            else:
+                                _results.insert(0, {**row, "origin": "tool_nhac", "date_added": audio.date_added})
+                            asyncio.get_event_loop().create_task(_broadcast({"type": "result", "data": row}))
 
-                except asyncio.TimeoutError:
-                    _emit_log(f"⚠️ AI Check quá lâu (60s), bỏ qua: {audio.audio_id}", "nhac")
-                    audio.status = "rejected"
-                    audio.reason = "AI Timeout"
-                    await update_audio_ai_result(audio)
-                except Exception as e:
-                    _emit_log(f"❌ AI Check lỗi ({audio.audio_id}): {e}", "nhac")
-                    audio.status = "rejected"
-                    audio.reason = f"AI Error: {e}"
-                    await update_audio_ai_result(audio)
+                    except asyncio.TimeoutError:
+                        _emit_log(f"⚠️ AI Check quá lâu (60s), bỏ qua: {audio.audio_id}", "nhac")
+                        audio.status = "rejected"
+                        audio.reason = "AI Timeout"
+                        await update_audio_record(audio)
+                    except Exception as e:
+                        _emit_log(f"❌ AI Check lỗi ({audio.audio_id}): {e}", "nhac")
+                        audio.status = "rejected"
+                        audio.reason = f"AI Error: {e}"
+                        await update_audio_record(audio)
 
             await asyncio.gather(*[_proc(a) for a in pending])
             # _emit_log(f"✅ [Phase 3] Xử lý xong lô {len(pending)} audio.", "nhac")
@@ -1029,7 +1633,6 @@ async def get_creators():
 
 
 # ── Creator Scanner API ────────────────────────────────────────────────────────
-_scanner_task: Optional[asyncio.Task] = None
 _scanner_log:  list = []
 
 def _scanner_emit(msg: str):
@@ -1039,38 +1642,52 @@ def _scanner_emit(msg: str):
     _emit_log(msg, "miner")  # Stream về log FYP trên dashboard
 
 async def _run_creator_scan(usernames: list, force: bool = False):
-    """Chạy CreatorScanner trong nền."""
+    """Chạy Creator Mining Engine từ main.py — luồng duy nhất qua AudioPipeline."""
     global _scanner_task
     try:
-        import sys, traceback as tb
-        sys.path.insert(0, str(BASE_DIR.parent / "tool_sroll_feed"))
-        from creator_scanner import CreatorScanner, report_scan_result
-
-        scanner = CreatorScanner(
-            page         = None,
-            checked_audio= set(r["audio_id"] for r in _results),
-            on_result    = report_scan_result,
-            log_fn       = _scanner_emit,
+        from main import process_profile_batch
+        from audio_pipeline import AudioPipeline
+        
+        pipeline = AudioPipeline.get()
+        
+        def _on_scan_result(row):
+            """Callback khi scan tìm được audio — đẩy lên UI ngay."""
+            entry = _build_result_entry(row, origin="tool_nhac")
+            entry["source"] = normalize_source(entry.get("source", "creator"))
+            if not any(r["audio_id"] == entry["audio_id"] for r in _results):
+                _results.insert(0, entry)
+            asyncio.get_event_loop().create_task(
+                _broadcast({"type": "result", "data": entry})
+            )
+            asyncio.get_event_loop().create_task(_telegram_notify_result(entry))
+        
+        # Emit structured event khi bắt đầu
+        await _broadcast({"type": "creator_event", "event": "crawl_started",
+                         "creators": usernames[:10], "total": len(usernames)})
+        
+        await process_profile_batch(
+            batch_count=1,
+            pipeline=pipeline,
+            emit=_scanner_emit,
+            on_result=_on_scan_result,
+            on_ai_queued=_ai_wakeup.set,
+            usernames=usernames
         )
         
-        # [V2.2 Smart] Chạy cuốn chiếu từng user để Phase 3 có thể làm việc ngay
-        # results = await scanner.scan_batch(usernames, force=force) # <-- Code cũ quét cả mẻ
-        
-        total_pass = 0
-        for user in usernames:
-            if _stop_event and _stop_event.is_set(): break
-            res = await scanner.scan_creator(user, force=force)
-            passed = len(res) if isinstance(res, list) else res.get('passed', 0)
-            total_pass += passed
-            _scanner_emit(f"✅ Xong @{user}: Đã bàn giao {passed} audio cho Phase 3.")
-            _ai_wakeup.set() # Rung chuông báo cho AI Check worker
-            
-        _scanner_emit(f"🎉 Quét xong {len(usernames)} creator → Tổng {total_pass} audio tiềm năng.")
+        _scanner_emit(f"🎉 Quét xong {len(usernames)} creator.")
+        await _broadcast({"type": "creator_event", "event": "creator_completed",
+                         "total": len(usernames)})
 
+    except asyncio.CancelledError:
+        _scanner_emit("⏹ Đã dừng Creator Miner.")
+        await _broadcast({"type": "creator_event", "event": "creator_stopped"})
+        raise
     except Exception as e:
         import traceback as tb
         _scanner_emit(f"❌ Creator Scanner lỗi: {e}")
         _scanner_emit(tb.format_exc())
+        await _broadcast({"type": "creator_event", "event": "creator_failed",
+                         "error": str(e)})
     finally:
         _scanner_task = None
 
@@ -1124,6 +1741,72 @@ async def creator_scan_status():
         "running": _scanner_task is not None and not _scanner_task.done(),
         "log":     _scanner_log[-30:],
     }
+
+
+@app.post("/creator/stop")
+async def creator_scan_stop():
+    global _scanner_task
+    if _scanner_task and not _scanner_task.done():
+        _scanner_task.cancel()
+        return {"ok": True, "msg": "Đã gửi lệnh dừng Creator Miner"}
+    return {"ok": False, "msg": "Creator Miner hiện không chạy"}
+
+@app.get("/creator/stats")
+async def creator_stats_api():
+    """Số liệu dashboard cho Creator Ops."""
+    stats = _get_stats()
+    by_status = stats.get("by_status", {})
+    
+    # Đếm creator state từ creator_state.json
+    vip_count = normal_count = cooldown_count = 0
+    try:
+        state_file = BASE_DIR / "data" / "creator_state.json"
+        if state_file.exists():
+            import json as _json
+            state_data = _json.loads(state_file.read_text(encoding='utf-8'))
+            for u, info in state_data.items():
+                tag = info.get("tag", "NORMAL")
+                if tag == "VIP": vip_count += 1
+                elif tag == "COOLDOWN": cooldown_count += 1
+                else: normal_count += 1
+    except Exception:
+        pass
+    
+    # Top reject reasons
+    reject_reasons = {}
+    for r in _results:
+        if r.get("status") == "rejected" and r.get("reason"):
+            reason = r["reason"][:60]
+            reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+    top_reasons = sorted(reject_reasons.items(), key=lambda x: -x[1])[:10]
+    
+    # Avg scores
+    accepted = [r for r in _results if r.get("status") == "accepted"]
+    avg_ai = round(sum(r.get("ai_score", 0) for r in accepted) / max(len(accepted), 1), 1)
+    avg_usage = round(sum(r.get("usage_count", 0) for r in accepted) / max(len(accepted), 1))
+    
+    return {
+        "creators_queued": _creators_count(),
+        "creators_scanning": 1 if (_scanner_task and not _scanner_task.done()) else 0,
+        "pending_usage": by_status.get("pending_usage_check", 0),
+        "pending_ai": by_status.get("pending_ai", 0) + by_status.get("pending_ai_recheck", 0),
+        "accepted": by_status.get("accepted", 0),
+        "rejected": by_status.get("rejected", 0),
+        "reject_reason_top": [{"reason": r, "count": c} for r, c in top_reasons],
+        "avg_ai_score": avg_ai,
+        "avg_usage": avg_usage,
+        "vip_count": vip_count,
+        "normal_count": normal_count,
+        "cooldown_count": cooldown_count,
+    }
+
+@app.get("/creator/results")
+async def creator_results_api(status: str = "all", limit: int = 500):
+    """Kết quả creator scan, filter theo status."""
+    filtered = [r for r in _results if r.get("source") == "creator"]
+    if status != "all":
+        filtered = [r for r in filtered if r.get("status") == status]
+    return {"results": filtered[:limit], "total": len(filtered)}
 
 @app.post("/creator/import-seen-excel")
 async def creator_import_seen_excel(body: dict):
@@ -1381,7 +2064,8 @@ async def ws_endpoint(ws: WebSocket):
         "fyp_status":       _fyp_status_str(),
         "expander_status":  "running" if (_expander_task and not _expander_task.done()) else "stopped",
         "target":           _target,
-        "results":          _results[:300],
+        # Gửi toàn bộ accepted + tối đa 500 records khác (pending/rejected)
+        "results":          [r for r in _results if r.get("status") == "accepted"] + [r for r in _results if r.get("status") != "accepted"][:500],
         "nhac_logs":        _nhac_log[-100:],
         "fyp_logs":         _fyp_log[-100:],
         "miner_logs":       _miner_log[-100:],
